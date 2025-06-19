@@ -27,6 +27,7 @@ import (
 	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
 	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificaterequests"
 	crutil "github.com/cert-manager/cert-manager/pkg/controller/certificaterequests/util"
@@ -45,8 +46,9 @@ type templateGenerator func(*cmapi.CertificateRequest) (*x509.Certificate, error
 type signingFn func([]*x509.Certificate, crypto.Signer, *x509.Certificate) (pki.PEMBundle, error)
 
 type CA struct {
-	issuerOptions controllerpkg.IssuerOptions
-	secretsLister internalinformers.SecretLister
+	issuerOptions      controllerpkg.IssuerOptions
+	secretsLister      internalinformers.SecretLister
+	certificatesLister cmlisters.CertificateLister
 
 	reporter *crutil.Reporter
 
@@ -61,11 +63,12 @@ type CA struct {
 
 func NewCA(ctx *controllerpkg.Context) certificaterequests.Issuer {
 	return &CA{
-		issuerOptions:     ctx.IssuerOptions,
-		secretsLister:     ctx.KubeSharedInformerFactory.Secrets().Lister(),
-		reporter:          crutil.NewReporter(ctx.Clock, ctx.Recorder),
-		templateGenerator: pki.CertificateTemplateFromCertificateRequest,
-		signingFn:         pki.SignCSRTemplate,
+		issuerOptions:      ctx.IssuerOptions,
+		secretsLister:      ctx.KubeSharedInformerFactory.Secrets().Lister(),
+		certificatesLister: ctx.SharedInformerFactory.Certmanager().V1().Certificates().Lister(),
+		reporter:           crutil.NewReporter(ctx.Clock, ctx.Recorder),
+		templateGenerator:  pki.CertificateTemplateFromCertificateRequest,
+		signingFn:          pki.SignCSRTemplate,
 	}
 }
 
@@ -77,6 +80,11 @@ func (c *CA) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuerObj c
 
 	secretName := issuerObj.GetSpec().CA.SecretName
 	resourceNamespace := c.issuerOptions.ResourceNamespace(issuerObj)
+
+	// Check for secret name conflict between certificate and CA issuer
+	if conflictDetected := c.validateSecretNameConflict(ctx, cr, secretName, resourceNamespace); conflictDetected {
+		return nil, nil
+	}
 
 	// get a copy of the CA certificate named on the Issuer
 	caCerts, caKey, err := kube.SecretTLSKeyPairAndCA(ctx, c.secretsLister, resourceNamespace, issuerObj.GetSpec().CA.SecretName)
@@ -140,4 +148,42 @@ func init() {
 			For(certificaterequests.New(apiutil.IssuerCA, NewCA)).
 			Complete()
 	})
+}
+
+// validateSecretNameConflict checks if the certificate's secretName conflicts with the CA issuer's secretName
+// Returns true if a conflict is detected and the request should not be processed further
+func (c *CA) validateSecretNameConflict(ctx context.Context, cr *cmapi.CertificateRequest, caSecretName, caSecretNamespace string) bool {
+	log := logf.FromContext(ctx, "validateSecretNameConflict")
+
+	// Get the certificate name from the CertificateRequest annotation
+	certificateName, exists := cr.Annotations[cmapi.CertificateNameKey]
+	if !exists {
+		// If there's no certificate name annotation, this might be a direct CertificateRequest
+		// or an older version, so we can't perform this validation
+		log.V(logf.DebugLevel).Info("CertificateRequest missing certificate name annotation, skipping secret name conflict validation")
+		return false
+	}
+
+	// Get the certificate object
+	cert, err := c.certificatesLister.Certificates(cr.Namespace).Get(certificateName)
+	if k8sErrors.IsNotFound(err) {
+		log.V(logf.DebugLevel).Info("Certificate not found, skipping secret name conflict validation", "certificateName", certificateName)
+		return false
+	}
+	if err != nil {
+		log.Error(err, "Failed to get certificate for secret name conflict validation", "certificateName", certificateName)
+		// For lister errors, continue processing - don't block certificate issuance on this validation
+		return false
+	}
+
+	// Check if the certificate's secretName matches the CA issuer's secretName
+	if cert.Spec.SecretName == caSecretName && cr.Namespace == caSecretNamespace {
+		message := fmt.Sprintf("Certificate secretName cannot be the same as the CA issuer secretName. The certificate's secretName '%s' conflicts with the CA issuer's secretName '%s'. Please use a different secretName for the certificate.", cert.Spec.SecretName, caSecretName)
+		log.Info("Secret name conflict detected", "certificateSecretName", cert.Spec.SecretName, "caSecretName", caSecretName, "namespace", cr.Namespace)
+		
+		c.reporter.Pending(cr, nil, "SecretNameConflict", message)
+		return true // Return true to stop processing, as this is a configuration error
+	}
+
+	return false
 }

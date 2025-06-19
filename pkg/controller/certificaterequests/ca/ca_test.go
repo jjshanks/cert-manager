@@ -395,6 +395,49 @@ func TestSign(t *testing.T) {
 				},
 			},
 		},
+		"certificate secretName conflicts with CA issuer secretName should set pending condition": {
+			certificateRequest: gen.CertificateRequestFrom(baseCR,
+				gen.AddCertificateRequestAnnotations(map[string]string{
+					cmapi.CertificateNameKey: "test-certificate", // Links to certificate
+				}),
+			),
+			builder: &testpkg.Builder{
+				KubeObjects: []runtime.Object{rsaCASecret.DeepCopy()},
+				CertManagerObjects: []runtime.Object{
+					gen.CertificateRequestFrom(baseCR,
+						gen.AddCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateNameKey: "test-certificate",
+						}),
+					),
+					baseIssuer.DeepCopy(),
+					gen.Certificate("test-certificate",
+						gen.SetCertificateSecretName("root-ca-secret"), // Same as CA issuer secret!
+					),
+				},
+				ExpectedEvents: []string{
+					"Normal SecretNameConflict Certificate secretName cannot be the same as the CA issuer secretName. The certificate's secretName 'root-ca-secret' conflicts with the CA issuer's secretName 'root-ca-secret'. Please use a different secretName for the certificate.",
+				},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
+						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						"status",
+						gen.DefaultTestNamespace,
+						gen.CertificateRequestFrom(baseCR,
+							gen.AddCertificateRequestAnnotations(map[string]string{
+								cmapi.CertificateNameKey: "test-certificate",
+							}),
+							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+								Type:               cmapi.CertificateRequestConditionReady,
+								Status:             cmmeta.ConditionFalse,
+								Reason:             cmapi.CertificateRequestReasonPending,
+								Message:            "Certificate secretName cannot be the same as the CA issuer secretName. The certificate's secretName 'root-ca-secret' conflicts with the CA issuer's secretName 'root-ca-secret'. Please use a different secretName for the certificate.",
+								LastTransitionTime: &metaFixedClockStart,
+							}),
+						),
+					)),
+				},
+			},
+		},
 	}
 
 	for name, test := range tests {
@@ -624,6 +667,7 @@ func TestCA_Sign(t *testing.T) {
 		})
 	}
 }
+
 
 // Returns a map that is meant to be used for creating a certificate Secret
 // that contains the fields "tls.crt" and "tls.key".
